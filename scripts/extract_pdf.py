@@ -3,11 +3,13 @@
 """PDF 结构化提取脚本。
 
 只做提取，不做任何写回 PDF 的操作：
-  - 文本层：标题/段落按阅读顺序与多栏重排
+  - 文本层：标题/段落按阅读顺序与多栏重排（可选 pymupdf4llm 提升保真度）
   - 表格：find_tables 两策略，输出 Markdown 内联 + CSV + 表格预览图
   - 图片：按内容去重导出，按覆盖面积/宽高比/信息量过滤装饰图
   - 扫描页 / 乱码页：渲染 PNG，交 Agent 视觉识别
   - 文档大纲(TOC) 与 超链接 提取
+  - 每页质量信号（置信度/密度）+ 页面分类（native/scanned/mixed）
+  - 可选结果缓存（~/.cache/pdf-structured-extractor/）
 
 stdout 只输出 JSON，诊断信息写 stderr。
 """
@@ -16,6 +18,7 @@ import sys
 import os
 import csv
 import json
+import shutil
 import hashlib
 import io
 import statistics
@@ -46,10 +49,31 @@ def _fail(code, message):
     sys.exit(1)
 
 
+def _emit_ok(obj):
+    """用于缓存工具命令（--cache-stats / --clear-all-cache）的成功返回。"""
+    _emit(obj)
+    sys.exit(0)
+
+
+# pymupdf4llm 为可选依赖：提供更高保真度的 Markdown（粗体/斜体/列表/表格）。
+# 它当前（1.28.x）会额外拉入一个基于 onnxruntime 的版面模型（约 57MB），
+# 因此默认不启用、不强制安装；仅当用户显式安装后通过 --md-lib 选用。
 try:
-    import fitz  # PyMuPDF
+    import pymupdf4llm  # type: ignore
+    HAS_PYMUPDF4LLM = True
+except Exception:
+    pymupdf4llm = None
+    HAS_PYMUPDF4LLM = False
+
+try:
+    # PyMuPDF >= 1.24.3 起 fitz 为废弃别名，会打印 deprecation warning 污染 stderr；
+    # 优先用新入口 pymupdf，仍以 fitz 之名使用，旧版本则回退真实 fitz 模块。
+    import pymupdf as fitz  # type: ignore
 except ImportError:
-    _fail("IMPORT_FAILED", "缺少依赖 pymupdf，请安装：pip install \"pymupdf>=1.28.2\"")
+    try:
+        import fitz  # PyMuPDF < 1.24.3  # type: ignore
+    except ImportError:
+        _fail("IMPORT_FAILED", "缺少依赖 pymupdf，请安装：pip install \"pymupdf>=1.28.2\"")
 
 
 # ---------- 阈值常量 ----------
@@ -63,6 +87,11 @@ BG_COVERAGE = 0.85          # 单图覆盖页面面积比例超过此值 → 视
 MAX_ASPECT_RATIO = 12.0     # 宽高比（长边/短边）超过此值 → 横幅/分隔条，跳过
 SOLID_COVERAGE = 0.5        # 覆盖比例 ≥ 此值且唯一颜色极少 → 纯色块，跳过
 SOLID_UNIQUE_COLORS = 2     # 唯一颜色数 ≤ 此值且面积足够大 → 纯色块
+# 页面分类阈值
+MIXED_TEXT_MAX = 200        # 文字字符数低于此值且含图 → 视为 mixed（图文混合偏图）
+NATIVE_TEXT_MIN = 20        # 文字字符数低于此值 → 视为稀疏，置信度降级
+# 脚本版本（纳入缓存键，版本升级自动失效旧缓存）
+SCRIPT_VERSION = "2.2.1"
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -210,6 +239,43 @@ def build_text_section(lines, page_width, exclude_rects=None):
     while "\n\n\n" in text:
         text = text.replace("\n\n\n", "\n\n")
     return text
+
+
+def build_text_section_plain(lines, page_width, exclude_rects=None):
+    """纯文本版：仅段落与换行，不引入 Markdown 标题/强调语法。"""
+    if not lines:
+        return ""
+    ordered, _ = order_lines(lines, page_width)
+    out = []
+    prev = None
+    for ln in ordered:
+        if exclude_rects and _line_in_rects(ln, exclude_rects):
+            prev = ln
+            continue
+        if prev is not None:
+            gap = ln["y0"] - prev["y1"]
+            line_h = max(prev["y1"] - prev["y0"], 1)
+            if gap > line_h * PAGE_SEP_GAP_RATIO:
+                out.append("")
+        out.append(ln["text"])
+        prev = ln
+    text = "\n".join(out).strip()
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text
+
+
+def _try_pymupdf4llm(doc, page_no):
+    """尝试用 pymupdf4llm 生成更高保真度的单页 Markdown；失败/空返回 None。"""
+    if not HAS_PYMUPDF4LLM:
+        return None
+    try:
+        md = pymupdf4llm.to_markdown(doc, pages=[page_no - 1], write_images=False)
+    except Exception:
+        return None
+    if not md or not md.strip():
+        return None
+    return md.strip()
 
 
 def markdown_table(cells):
@@ -530,6 +596,29 @@ def extract_links(page):
 # 页面 / 文档级拼装
 # ----------------------------------------------------------------------
 
+def compute_quality(page_width, page_height, text_chars, has_img,
+                    table_count, scanned, garbled):
+    """计算单页质量信号，含置信度分级。"""
+    area = page_width * page_height
+    density = round(text_chars / max(1.0, area / 10000.0), 3)
+    confidence = "high"
+    if scanned or garbled:
+        confidence = "low"
+    elif text_chars < NATIVE_TEXT_MIN:
+        confidence = "medium"
+    elif density < 0.3:
+        confidence = "medium"
+    return {
+        "text_density": density,
+        "text_chars": text_chars,
+        "has_table": table_count > 0,
+        "has_image": bool(has_img),
+        "suspected_scan": bool(scanned),
+        "garbled": bool(garbled),
+        "confidence": confidence,
+    }
+
+
 def extract_page(doc, page, page_no, out_dir, opts):
     page_width = page.rect.width
     page_height = page.rect.height
@@ -543,6 +632,7 @@ def extract_page(doc, page, page_no, out_dir, opts):
     except Exception:
         has_img = False
 
+    fmt = opts["format"]
     warnings = []
     page_md_parts = []
     tables_md, tables_json, table_rects = extract_tables(
@@ -554,6 +644,7 @@ def extract_page(doc, page, page_no, out_dir, opts):
 
     text_md = ""
     scan_png = None
+    used_lib = False
     if scanned:
         scan_png = render_scan(page, page_no, os.path.join(out_dir, "scans"), opts["dpi"])
         text_status = "scan_required"
@@ -563,29 +654,67 @@ def extract_page(doc, page, page_no, out_dir, opts):
         text_status = "scan_required"
         warnings.append("garbled_text_detected")
     else:
-        text_md = build_text_section(lines, page_width, table_rects)
+        if fmt == "text":
+            text_md = build_text_section_plain(lines, page_width, table_rects)
+        else:
+            if opts["md_lib"] != "builtin":
+                lib_md = _try_pymupdf4llm(doc, page_no)
+                if lib_md is not None:
+                    text_md = lib_md
+                    used_lib = True
+            if not used_lib:
+                text_md = build_text_section(lines, page_width, table_rects)
         text_status = "extracted"
         if garbled:
             warnings.append("garbled_text_detected")
 
     links = extract_links(page) if not opts["no_links"] else []
 
-    # 拼装页面 Markdown
-    page_md_parts.append(f"<!-- page:{page_no} -->")
-    page_md_parts.append(f"## 第 {page_no} 页")
-    if scan_png:
-        page_md_parts.append(
-            f"> ⚠️ 该页几乎无文字层或文字层乱码（疑似扫描件/可变字体），已导出 `{scan_png}`，"
-            f"待视觉识别后回填此区块。")
+    # 页面分类
+    if text_status == "scan_required":
+        page_class = "scanned"
+    elif has_img and text_chars < MIXED_TEXT_MAX:
+        page_class = "mixed"
     else:
-        if text_md:
-            page_md_parts.append(text_md)
-    for tmd in tables_md:
-        page_md_parts.append("")
-        page_md_parts.append(tmd)
-    for img in images_json:
-        page_md_parts.append("")
-        page_md_parts.append(f"![图片]({img['path']})")
+        page_class = "native"
+
+    quality = compute_quality(
+        page_width, page_height, text_chars, has_img,
+        len(tables_json), scanned, garbled)
+
+    # 拼装页面正文（按输出格式）
+    if fmt == "text":
+        page_md_parts.append(f"第 {page_no} 页")
+        if scan_png:
+            page_md_parts.append(
+                f"[该页几乎无文字层或文字层乱码（疑似扫描件/可变字体），已导出 {scan_png}，待视觉识别后回填]")
+        else:
+            if text_md:
+                page_md_parts.append(text_md)
+        for tmd in tables_md:
+            page_md_parts.append("")
+            page_md_parts.append(tmd)
+        for img in images_json:
+            page_md_parts.append("")
+            page_md_parts.append(f"[图片: {img['path']}]")
+    else:
+        page_md_parts.append(f"<!-- page:{page_no} -->")
+        page_md_parts.append(f"## 第 {page_no} 页")
+        if scan_png:
+            page_md_parts.append(
+                f"> ⚠️ 该页几乎无文字层或文字层乱码（疑似扫描件/可变字体），已导出 `{scan_png}`，"
+                f"待视觉识别后回填此区块。")
+        else:
+            if text_md:
+                page_md_parts.append(text_md)
+        # 使用 pymupdf4llm 时其输出已含表格，避免与内联表格重复
+        if not used_lib:
+            for tmd in tables_md:
+                page_md_parts.append("")
+                page_md_parts.append(tmd)
+        for img in images_json:
+            page_md_parts.append("")
+            page_md_parts.append(f"![图片]({img['path']})")
 
     page_md = "\n".join(page_md_parts).strip()
 
@@ -593,6 +722,8 @@ def extract_page(doc, page, page_no, out_dir, opts):
         "page": page_no,
         "text_status": text_status,
         "text_chars": text_chars,
+        "page_class": page_class,
+        "quality": quality,
         "tables": tables_json,
         "images": images_json,
         "links": links,
@@ -611,7 +742,11 @@ def extract_document(doc, out_dir, opts):
         except Exception as e:
             pres = {
             "page": i + 1, "text_status": "error",
-            "text_chars": 0, "tables": [], "images": [], "links": [],
+            "text_chars": 0, "page_class": "native",
+            "quality": {"text_density": 0.0, "text_chars": 0, "has_table": False,
+                        "has_image": False, "suspected_scan": False, "garbled": False,
+                        "confidence": "low"},
+            "tables": [], "images": [], "links": [],
             "scan_png": None,
             "warnings": [f"处理异常: {e}"], "md": "",
             }
@@ -619,18 +754,30 @@ def extract_document(doc, out_dir, opts):
     return pages
 
 
-def build_markdown(src_path, doc_meta, pages, scan_pages):
+def build_markdown(src_path, doc_meta, pages, scan_pages, fmt):
     stem = Path(src_path).stem
-    lines = [f"# {stem} · 内容提取", ""]
-    lines.append("- 源文件: " + src_path)
-    lines.append(f"- 页数: {doc_meta.get('page_count', 0)}")
-    lines.append(f"- 标题: {doc_meta.get('title', '')}")
-    lines.append(f"- 作者: {doc_meta.get('author', '')}")
-    if doc_meta.get("outline"):
-        lines.append(f"- 大纲(TOC)层级数: {len(doc_meta['outline'])}")
-    if scan_pages:
-        lines.append("- 扫描页(需视觉识别): " + ", ".join(f"第 {p} 页" for p in scan_pages))
-    lines.append("")
+    if fmt == "text":
+        lines = [f"{stem} · 内容提取", ""]
+        lines.append(f"源文件: {src_path}")
+        lines.append(f"页数: {doc_meta.get('page_count', 0)}")
+        lines.append(f"标题: {doc_meta.get('title', '')}")
+        lines.append(f"作者: {doc_meta.get('author', '')}")
+        if doc_meta.get("outline"):
+            lines.append(f"大纲(TOC)层级数: {len(doc_meta['outline'])}")
+        if scan_pages:
+            lines.append("扫描页(需视觉识别): " + ", ".join(f"第 {p} 页" for p in scan_pages))
+        lines.append("")
+    else:
+        lines = [f"# {stem} · 内容提取", ""]
+        lines.append("- 源文件: " + src_path)
+        lines.append(f"- 页数: {doc_meta.get('page_count', 0)}")
+        lines.append(f"- 标题: {doc_meta.get('title', '')}")
+        lines.append(f"- 作者: {doc_meta.get('author', '')}")
+        if doc_meta.get("outline"):
+            lines.append(f"- 大纲(TOC)层级数: {len(doc_meta['outline'])}")
+        if scan_pages:
+            lines.append("- 扫描页(需视觉识别): " + ", ".join(f"第 {p} 页" for p in scan_pages))
+        lines.append("")
     for p in pages:
         if p["md"]:
             lines.append(p["md"])
@@ -638,15 +785,153 @@ def build_markdown(src_path, doc_meta, pages, scan_pages):
     return "\n".join(lines).strip() + "\n"
 
 
+# ----------------------------------------------------------------------
+# 可选结果缓存（~/.cache/pdf-structured-extractor/）
+# ----------------------------------------------------------------------
+
+def cache_root():
+    return Path.home() / ".cache" / "pdf-structured-extractor"
+
+
+def cache_key_for(src, opts):
+    """基于 文件路径+大小+mtime+选项+脚本版本 计算缓存键，任一变化即失效。"""
+    try:
+        st = src.stat()
+        size = st.st_size
+        mtime = st.st_mtime_ns
+    except Exception:
+        size = -1
+        mtime = -1
+    opt_str = "|".join([
+        str(opts["dpi"]), str(opts["no_images"]), str(opts["no_tables"]),
+        str(opts["no_links"]), opts["format"], opts["md_lib"],
+    ])
+    raw = f"{src.resolve()}|{size}|{mtime}|{opt_str}|{SCRIPT_VERSION}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def cache_entry(key):
+    return cache_root() / key
+
+
+ASSET_SUBDIRS = ["images", "tables", "tables_preview", "scans"]
+
+
+def cache_save(key, out_dir, stem, ext, result):
+    """把本次提取结果（资源 + 正文 + JSON）存入缓存，供下次命中直接复用。"""
+    entry = cache_entry(key)
+    try:
+        if entry.exists():
+            shutil.rmtree(entry)
+        entry.mkdir(parents=True)
+        for sub in ASSET_SUBDIRS:
+            s = out_dir / sub
+            if s.exists() and any(s.iterdir()):
+                shutil.copytree(s, entry / sub)
+        body_src = out_dir / f"{stem}.{ext}"
+        if body_src.exists():
+            shutil.copy2(body_src, entry / "body.md")
+        cache_result = json.loads(json.dumps(result))
+        cache_result["output_dir"] = str(entry)
+        cache_result["markdown_path"] = str(entry / "body.md")
+        cache_result["cache_hit"] = False
+        (entry / "result.json").write_text(
+            json.dumps(cache_result, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass  # 缓存失败绝不影响主流程
+
+
+def cache_restore(key, out_dir, stem, ext):
+    """命中缓存：把缓存的资源与正文恢复到 out_dir，并重写路径字段。"""
+    entry = cache_entry(key)
+    if not entry.exists():
+        return None
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for sub in ASSET_SUBDIRS:
+            s = entry / sub
+            if s.exists() and any(s.iterdir()):
+                (out_dir / sub).mkdir(parents=True, exist_ok=True)
+                shutil.copytree(s, out_dir / sub, dirs_exist_ok=True)
+        body_src = entry / "body.md"
+        if body_src.exists():
+            shutil.copy2(body_src, out_dir / f"{stem}.{ext}")
+        result = json.loads((entry / "result.json").read_text(encoding="utf-8"))
+        result["output_dir"] = str(out_dir)
+        result["markdown_path"] = str(out_dir / f"{stem}.{ext}")
+        result["cache_hit"] = True
+        return result
+    except Exception:
+        return None
+
+
+def cache_stats_result():
+    root = cache_root()
+    entries = 0
+    size = 0
+    if root.exists():
+        for p in root.iterdir():
+            if p.is_dir():
+                entries += 1
+                for f in p.rglob("*"):
+                    if f.is_file():
+                        size += f.stat().st_size
+    return {"ok": True, "action": "cache_stats", "cache_dir": str(root),
+            "entries": entries, "size_bytes": size}
+
+
+def clear_all_cache():
+    root = cache_root()
+    n = 0
+    if root.exists():
+        for p in root.iterdir():
+            if p.is_dir():
+                shutil.rmtree(p)
+                n += 1
+    return n
+
+
+def resolve_md_lib(choice):
+    """解析 --md-lib：builtin 强制内置；auto 有则用之；pymupdf4llm 缺失则回退。"""
+    if choice == "builtin":
+        return "builtin"
+    if choice == "pymupdf4llm":
+        if not HAS_PYMUPDF4LLM:
+            sys.stderr.write("警告: 指定 --md-lib pymupdf4llm 但未安装 pymupdf4llm，回退 builtin\n")
+            return "builtin"
+        return "pymupdf4llm"
+    # auto
+    return "pymupdf4llm" if HAS_PYMUPDF4LLM else "builtin"
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("input")
-    ap.add_argument("--output-dir", required=True)
+    ap.add_argument("input", nargs="?")
+    ap.add_argument("--output-dir")
     ap.add_argument("--dpi", type=int, default=SCAN_DPI)
     ap.add_argument("--no-images", action="store_true")
     ap.add_argument("--no-tables", action="store_true")
     ap.add_argument("--no-links", action="store_true")
+    ap.add_argument("--no-cache", action="store_true")
+    ap.add_argument("--clear-cache", action="store_true")
+    ap.add_argument("--clear-all-cache", action="store_true")
+    ap.add_argument("--cache-stats", action="store_true")
+    ap.add_argument("--format", choices=["markdown", "text"], default="markdown")
+    ap.add_argument("--md-lib", choices=["builtin", "auto", "pymupdf4llm"], default="builtin")
     args = ap.parse_args()
+
+    # 缓存工具命令（无需 input / output-dir）
+    if args.cache_stats:
+        _emit_ok(cache_stats_result())
+        return
+    if args.clear_all_cache:
+        _emit_ok({"ok": True, "action": "clear_all_cache", "cleared_entries": clear_all_cache()})
+        return
+
+    if not args.input:
+        _fail("ARG_MISSING", "缺少位置参数 input（PDF 路径）")
+    if not args.output_dir:
+        _fail("ARG_MISSING", "缺少 --output-dir")
 
     # 校验输入
     src = Path(args.input)
@@ -656,6 +941,35 @@ def main():
         _fail("NOT_PDF", f"仅支持 PDF，收到：{src.suffix}")
 
     out_dir = Path(args.output_dir)
+    ext = "txt" if args.format == "text" else "md"
+
+    opts = {
+        "dpi": args.dpi,
+        "no_images": args.no_images,
+        "no_tables": args.no_tables,
+        "no_links": args.no_links,
+        "no_cache": args.no_cache,
+        "format": args.format,
+        "md_lib": resolve_md_lib(args.md_lib),
+        "seen_hashes": {},
+    }
+
+    # 计算缓存键
+    key = cache_key_for(src, opts) if not args.no_cache else None
+    if args.clear_cache and key:
+        try:
+            e = cache_entry(key)
+            if e.exists():
+                shutil.rmtree(e)
+        except Exception:
+            pass
+
+    # 缓存命中（--clear-cache 时不走此处）
+    if key and not args.clear_cache:
+        restored = cache_restore(key, out_dir, src.stem, ext)
+        if restored is not None:
+            _emit(restored)
+            return
 
     try:
         doc = fitz.open(str(src))
@@ -705,13 +1019,6 @@ def main():
             doc.close()
             _fail("WRITE_FAILED", f"无法创建输出目录：{e}")
 
-        opts = {
-            "dpi": args.dpi,
-            "no_images": args.no_images,
-            "no_tables": args.no_tables,
-            "no_links": args.no_links,
-            "seen_hashes": {},
-        }
         pages = extract_document(doc, out_dir, opts)
         doc.close()
     except SystemExit:
@@ -729,8 +1036,19 @@ def main():
     image_count = sum(len(p["images"]) for p in pages)
     link_count = sum(len(p["links"]) for p in pages)
 
-    md = build_markdown(str(src), doc_meta, pages, scan_pages)
-    md_path = out_dir / (src.stem + ".md")
+    # 聚合质量警告（人类可读）
+    quality_warnings = []
+    for p in pages:
+        q = p.get("quality", {})
+        if q.get("suspected_scan"):
+            quality_warnings.append(f"第 {p['page']} 页: 疑似扫描件/无文字层，已渲染 PNG 待视觉识别")
+        elif q.get("garbled"):
+            quality_warnings.append(f"第 {p['page']} 页: 文字层疑似乱码，已渲染 PNG 待视觉识别")
+        elif q.get("confidence") == "medium":
+            quality_warnings.append(f"第 {p['page']} 页: 文字密度偏低，提取结果可能不完整")
+
+    md = build_markdown(str(src), doc_meta, pages, scan_pages, args.format)
+    md_path = out_dir / (src.stem + "." + ext)
     try:
         md_path.write_text(md, encoding="utf-8")
     except Exception as e:
@@ -738,6 +1056,7 @@ def main():
 
     result = {
         "ok": True,
+        "cache_hit": False,
         "input": str(src),
         "output_dir": str(out_dir),
         "markdown_path": str(md_path),
@@ -752,8 +1071,14 @@ def main():
             "image_count": image_count,
             "link_count": link_count,
         },
+        "quality_warnings": quality_warnings,
         "warnings": [],
     }
+
+    # 写入缓存（除非禁用）
+    if key:
+        cache_save(key, out_dir, src.stem, ext, result)
+
     _emit(result)
 
 

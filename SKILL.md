@@ -1,11 +1,29 @@
 ---
 name: pdf-structured-extractor
-description: 从 PDF 文档中结构化提取文字、表格与图片，保留标题层级和阅读顺序，支持双栏；扫描页自动渲染为图片交由视觉能力识别；适用于“提取 PDF 文字”“PDF 转 Markdown”“导出 PDF 表格为 CSV/Markdown”“导出 PDF 图片”“识别扫描 PDF/扫描件”等场景。
+description: >-
+  Extract text, tables and images from PDF files into structured Markdown and CSV,
+  preserving heading hierarchy and reading order. Handles two-column layouts;
+  scanned and garbled pages are rendered to PNG for visual recognition instead of
+  OCR (no Tesseract, no RapidOCR). Use when the user asks to extract PDF text,
+  convert PDF to Markdown, export PDF tables to CSV, extract embedded images,
+  or read a scanned PDF. 中文：从 PDF 结构化提取文字/表格/图片，保留标题层级与阅读顺序，支持双栏；
+  扫描页与文字层乱码页自动渲染为 PNG 交视觉识别，零 OCR 依赖。适用于“提取 PDF 文字”“PDF 转 Markdown”
+  “导出 PDF 表格为 CSV/Markdown”“导出 PDF 图片”“识别扫描 PDF/扫描件”。
 dependency:
   python:
   - pymupdf>=1.28.2
-version: 2.1.0
 author: Tony
+slug: pdf-structured-extractor
+displayName: PDF结构化提取
+summary: 结构化提取 PDF 文字/表格/图片，扫描页走视觉识别，可选缓存与置信信号，跨客户端通用（WorkBuddy/Claude Code/Codex）。
+license: MIT
+compatibility: Requires Python 3.8+ and PyMuPDF >= 1.28.2. Works with any agent that can run shell commands.
+metadata:
+  author: Tony
+  version: "2.2.1"
+  tags: pdf pdf-extraction markdown table-extraction document-parsing pymupdf ocr-free
+agent_created: true
+version: 2.2.1
 ---
 
 # PDF 结构化提取
@@ -60,7 +78,11 @@ letta、redfox 等官方/社区技能都做，重叠严重。本技能**不假�
 
 ## 运行环境
 
-- **唯一依赖**：Python 3.8+ 与 PyMuPDF ≥ 1.28.2（仅此一个第三方库，纯 Python，跨平台）。
+- **唯一必需依赖**：Python 3.8+ 与 PyMuPDF ≥ 1.28.2（纯 Python，跨平台）。
+- **可选依赖（更高保真 Markdown）**：`pymupdf4llm`（>=1.28.2）。它会额外拉入一个基于
+  onnxruntime 的版面模型（约 57MB），因此**默认不安装、不启用**。仅当用户显式
+  `pip install pymupdf4llm` 并通过 `--md-lib auto`（或 `pymupdf4llm`）选用时，文本层改用
+  pymupdf4llm 生成，保留加粗/斜体/列表/表格的真实 Markdown 语法；未安装时自动回退内置逻辑。
 - **安装依赖**（使用客户端自带的任意 Python，无需任何专属运行时）：
   ```bash
   python3 -m pip install "pymupdf>=1.28.2"   # Linux / macOS
@@ -112,7 +134,9 @@ pdf-structured-extractor/
 ```bash
 python3 "<skill_dir>/scripts/extract_pdf.py" \
   "<PDF路径>" --output-dir "<输出目录>" \
-  [--dpi 200] [--no-images] [--no-tables] [--no-links]
+  [--dpi 200] [--no-images] [--no-tables] [--no-links] \
+  [--format markdown|text] [--md-lib builtin|auto|pymupdf4llm] \
+  [--no-cache | --clear-cache | --clear-all-cache | --cache-stats]
 ```
 
 > Windows 上若 `python3` 不存在，改用 `python`。脚本不依赖任何客户端专属运行时。
@@ -121,24 +145,35 @@ python3 "<skill_dir>/scripts/extract_pdf.py" \
 
 - `--dpi`：扫描/乱码页渲染分辨率（默认 200）
 - `--no-images` / `--no-tables` / `--no-links`：分别关闭图片 / 表格 / 超链接提取
+- `--format`：输出正文格式，`markdown`（默认，含标题/表格 Markdown）或 `text`（纯文本，去 Markdown 语法，文件后缀 `.txt`）
+- `--md-lib`：文本层 Markdown 生成方式，`builtin`（默认，零额外依赖）/ `auto`（装了 pymupdf4llm 即用）/ `pymupdf4llm`（强制使用，未装则回退 builtin）
+- 缓存（基于 文件路径+大小+mtime+选项+脚本版本 自动失效）：
+  - 默认开启，命中时直接复用已提取的资源与 JSON，`result.cache_hit=true`
+  - `--no-cache`：本次不读不写缓存
+  - `--clear-cache`：清除当前 PDF 的缓存后重新提取
+  - `--clear-all-cache` / `--cache-stats`：清空全部缓存 / 打印缓存目录、条目数与占用空间
 
 ### 3. 解析 JSON 结果
 
 脚本只向 stdout 输出 JSON，诊断信息写 stderr（stdout 始终为单个纯净 JSON 对象）。
 结构：
 
-- 成功：`ok=true`，含 `markdown_path`、`document_info`、`pages`、`summary`
+- 成功：`ok=true`，含 `markdown_path`、`document_info`、`pages`、`summary`、`quality_warnings`、`cache_hit`
   - `document_info.outline`：文档大纲（TOC）列表 `[层级, 标题, 页码]`
   - `summary.scan_pages`：需要视觉识别的页码列表
   - `summary.link_count` / `table_count` / `image_count`
+  - `quality_warnings`：跨页聚合的置信提示，如 `第3页: 疑似扫描件/无文字层，已渲染 PNG 待视觉识别`、`第1页: 文字密度偏低，提取结果可能不完整`
+  - `cache_hit`：`true` 表示本次结果来自缓存
   - 每页 `text_status`：`extracted`（文字已提取）、`scan_required`
     （已渲染 PNG 待视觉识别）或 `error`（该页处理异常，见 `warnings`）
+  - 每页 `page_class`：页面分类 `native`（正常文本页）/ `scanned`（需视觉识别）/ `mixed`（含图且文字偏少）
+  - 每页 `quality`：质量信号 `{text_density, text_chars, has_table, has_image, suspected_scan, garbled, confidence}`，`confidence` 为 `high`/`medium`/`low`
   - 每页 `warnings`：如 `garbled_text_detected`（文字层疑似乱码）
   - 每页 `images[].bbox`：图片在页面中的坐标 `{x0,y0,x1,y1}`
   - 每页 `links`：超链接列表 `[{kind, uri?, page?}]`
 - 失败：`ok=false`，含 `error.code`，可能为
   `FILE_NOT_FOUND` / `NOT_PDF` / `OPEN_FAILED` / `PASSWORD_REQUIRED` /
-  `WRITE_FAILED` / `UNEXPECTED_ERROR` / `IMPORT_FAILED`
+  `WRITE_FAILED` / `UNEXPECTED_ERROR` / `IMPORT_FAILED` / `ARG_MISSING`
 
 ### 4. 扫描页视觉回填（关键）
 

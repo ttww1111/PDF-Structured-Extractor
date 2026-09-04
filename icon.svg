@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14b8a6"/>
+      <stop offset="1" stop-color="#3b82f6"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <!-- background rounded square -->
+  <rect x="16" y="16" width="480" height="480" rx="104" fill="url(#bg)"/>
+
+  <!-- document -->
+  <rect x="150" y="132" width="212" height="252" rx="20" fill="#ffffff" filter="url(#shadow)"/>
+
+  <!-- title bar -->
+  <rect x="172" y="156" width="120" height="16" rx="8" fill="#14b8a6"/>
+
+  <!-- text lines -->
+  <rect x="172" y="190" width="150" height="11" rx="5.5" fill="#cbd5e1"/>
+  <rect x="172" y="212" width="168" height="11" rx="5.5" fill="#e2e8f0"/>
+  <rect x="172" y="234" width="138" height="11" rx="5.5" fill="#e2e8f0"/>
+  <rect x="172" y="256" width="160" height="11" rx="5.5" fill="#e2e8f0"/>
+
+  <!-- table grid -->
+  <g stroke="#14b8a6" stroke-width="3" fill="none" opacity="0.9">
+    <rect x="172" y="284" width="168" height="72" rx="8"/>
+    <line x1="256" y1="284" x2="256" y2="356"/>
+    <line x1="172" y1="320" x2="340" y2="320"/>
+  </g>
+  <rect x="176" y="288" width="76" height="28" rx="5" fill="#ccfbf1" opacity="0.75"/>
+  <rect x="260" y="324" width="76" height="28" rx="5" fill="#dbeafe" opacity="0.75"/>
+
+  <!-- PDF label -->
+  <text x="256" y="380" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#94a3b8" text-anchor="middle" letter-spacing="3">PDF</text>
+
+  <!-- magnifier -->
+  <circle cx="368" cy="252" r="40" fill="#ffffff" opacity="0.18"/>
+  <circle cx="368" cy="252" r="40" fill="none" stroke="#ffffff" stroke-width="12"/>
+  <line x1="396" y1="280" x2="424" y2="308" stroke="#ffffff" stroke-width="14" stroke-linecap="round"/>
+
+  <!-- extracted block + arrow -->
+  <rect x="300" y="62" width="94" height="52" rx="12" fill="#ffffff" filter="url(#shadow)"/>
+  <rect x="316" y="78" width="62" height="10" rx="5" fill="#14b8a6"/>
+  <rect x="316" y="94" width="46" height="9" rx="4.5" fill="#cbd5e1"/>
+  <path d="M236 140 Q 300 106 338 114" fill="none" stroke="#ffffff" stroke-width="9" stroke-linecap="round"/>
+  <polygon points="338,114 321,108 330,124" fill="#ffffff"/>
+</svg>

@@ -1,45 +1,138 @@
 # pdf-structured-extractor
 
-从 PDF 文档中**结构化提取**文字、表格与图片，保留标题层级和阅读顺序，支持双栏；扫描页 / 文字层乱码页自动渲染为 PNG，交由视觉能力识别回填。适用于“提取 PDF 文字”“PDF 转 Markdown”“导出 PDF 表格为 CSV/Markdown”“导出 PDF 图片”“识别扫描 PDF/扫描件”等场景。
+Extract text, tables and images from PDF files into structured Markdown and CSV — heading hierarchy and reading order preserved, two-column layouts handled, scanned and garbled pages rendered to PNG for visual recognition instead of OCR.
 
-## 特性
+> 中文文档：[README.zh-CN.md](README.zh-CN.md)
 
-- **纯 Python**，唯一依赖 PyMuPDF（`pymupdf>=1.28.2`），跨平台
-- **干净 JSON 契约**：脚本只向 stdout 输出单个纯净 JSON，诊断信息走 stderr，便于 agent 消费
-- **扫描 / 乱码页走视觉能力**，零 OCR 重依赖（不装 Tesseract / RapidOCR）
-- **图片内容级过滤**：按内容（SHA-256）去重，自动跳过整页背景图、横幅、纯色块（水印/logo/背景噪声）
-- **跨客户端通用**：WorkBuddy / Claude Code / Codex 直接复制即用，无客户端专属配置
+## Why another PDF skill
 
-## 安装
+PDF extraction is a crowded space — `anthropics/skills`, `openai/skills`, `claude-office` and several community skills all do it. This one is deliberately narrower:
 
-把整个 `pdf-structured-extractor/` 文件夹复制到目标客户端的技能目录：
+| | anthropics/skills `pdf` | openai/skills `pdf` | **this skill** |
+| --- | --- | --- | --- |
+| Scope | Full toolbox: extract, merge, split, forms, encrypt, watermark, OCR | Render to PNG for visual review, generate PDFs with reportlab | **Extraction only** |
+| Dependencies | pypdf, pdfplumber, reportlab, qpdf, pdftotext, pdftk | reportlab + rendering | **PyMuPDF only** |
+| Output | Mixed | Visual / generated PDF | **Clean JSON contract for agents** |
+| Scanned pages | Tesseract OCR | Visual review | **Rendered PNG, filled in by the agent's vision** |
 
-| 客户端 | 技能目录 |
+Three things this skill does that the others don't:
+
+1. **Clean JSON contract.** A single JSON object goes to stdout, diagnostics go to stderr. Nothing else pollutes the stream, so an agent can parse it directly.
+2. **No OCR stack.** Scanned pages and garbled text layers are detected automatically and rendered to PNG for the agent's own vision capability. No Tesseract, no RapidOCR, no model downloads.
+3. **No telemetry, no ads, no network calls.** See [Privacy & security](#privacy--security).
+
+## Features
+
+- **Pure Python, one dependency.** PyMuPDF `>=1.28.2`, cross-platform.
+- **Reading order and heading hierarchy** preserved, including two-column layouts.
+- **Tables** exported as Markdown (inline) and UTF-8-SIG CSV, plus a cropped PNG of each table region for layout verification.
+- **Images** deduplicated by SHA-256 of content, with bounding boxes recorded. Decorative images are filtered out: full-page backgrounds (≥85% coverage), extreme aspect ratios (≥12:1), and large flat colour blocks — so watermarks, logos and background noise are dropped while real content images survive.
+- **Quality signals per page.** `quality` (text density, char count, table/image flags, suspected scan, garbled flag, confidence) and `page_class` (`native` / `scanned` / `mixed`), aggregated into a top-level `quality_warnings` list.
+- **Optional result cache.** On by default, invalidated by file path + size + mtime + options + script version.
+- **Garbled text detection.** Pages with U+FFFD replacement characters, Latin-1 mojibake or CJK corruption signatures are treated as unreadable and routed to vision instead of emitting garbage text.
+- **Optional higher-fidelity Markdown.** With `pymupdf4llm` installed, `--md-lib auto` keeps real bold / italic / list / table syntax. Off by default to avoid pulling a ~57MB layout model.
+- **Plain text output.** `--format text` strips Markdown syntax and writes `.txt`.
+- **Client-agnostic.** Works in WorkBuddy, Claude Code, Codex, or anywhere you can run a shell command.
+
+## Install
+
+```bash
+npx skills add ttww1111/pdf-structured-extractor
+```
+
+Or copy the folder into your client's skills directory:
+
+| Client | Skills directory |
 | --- | --- |
 | WorkBuddy | `~/.workbuddy/skills/pdf-structured-extractor/` |
 | Claude Code | `~/.claude/skills/pdf-structured-extractor/` |
-| Codex（OpenAI） | `~/.codex/skills/pdf-structured-extractor/`（若用 skills-manager，放入其源目录并建符号链接） |
+| Codex | `~/.codex/skills/pdf-structured-extractor/` |
 
-安装依赖：
+Then install the dependency:
 
 ```bash
 python3 -m pip install "pymupdf>=1.28.2"   # Linux / macOS
-python  -m pip install "pymupdf>=1.28.2"   # Windows（若 python3 不存在）
+python  -m pip install "pymupdf>=1.28.2"   # Windows
+
+# Optional: higher-fidelity Markdown (downloads a ~57MB layout model)
+python3 -m pip install "pymupdf4llm>=1.28.2"
 ```
 
-## 使用
+## Usage
 
-将 `<skill_dir>` 替换为本 `SKILL.md` 所在目录：
+Replace `<skill_dir>` with the directory containing `SKILL.md`:
 
 ```bash
 python3 "<skill_dir>/scripts/extract_pdf.py" \
-  "<PDF路径>" --output-dir "<输出目录>" \
-  [--dpi 200] [--no-images] [--no-tables] [--no-links]
+  "<path/to/file.pdf>" --output-dir "<path/to/output>" \
+  [--dpi 200] [--no-images] [--no-tables] [--no-links] \
+  [--format markdown|text] [--md-lib builtin|auto|pymupdf4llm] \
+  [--no-cache | --clear-cache | --clear-all-cache | --cache-stats]
 ```
 
-脚本向 stdout 输出 JSON 结果（含 `markdown_path`、`document_info`、`pages`、`summary`），
-扫描页会渲染到 `scans/*.png`，由视觉能力识别后回填 Markdown。详见 [SKILL.md](SKILL.md)。
+| Flag | Meaning |
+| --- | --- |
+| `--dpi` | Render resolution for scanned / garbled pages (default 200) |
+| `--no-images` / `--no-tables` / `--no-links` | Skip image / table / link extraction |
+| `--format` | `markdown` (default) or `text` (plain text, writes `.txt`) |
+| `--md-lib` | `builtin` (default, zero extra deps) / `auto` (use pymupdf4llm if present) / `pymupdf4llm` (force, falls back if missing) |
+| `--no-cache` | Bypass cache for this run |
+| `--clear-cache` | Drop this PDF's cache entry and re-extract |
+| `--clear-all-cache` / `--cache-stats` | Wipe the whole cache / report cache location, entry count and size |
 
-## 不做什么
+Use `python` instead of `python3` on Windows if needed.
 
-合并 / 拆分 / 加密 / 批注 / 去水印等任何 PDF 写回操作；本地 OCR；产品型号 / 价格等结构化业务字段（非普适，按需另写 skill）。
+### Scanned pages
+
+If `summary.scan_pages` is non-empty, read the matching `scans/pNNN.png` files with your vision capability and fill the content back into the `<!-- page:N -->` block of the Markdown. Mark anything you cannot confirm as `[illegible]` rather than guessing.
+
+## Output layout
+
+```text
+<name>_extracted/
+├── <name>.md            # body text, tables, image references
+├── images/              # deduplicated embedded images
+├── tables/              # one UTF-8-SIG CSV per table
+├── tables_preview/      # cropped PNG of each table region
+└── scans/               # PNG of scanned / garbled pages, for vision
+```
+
+Markdown references images with relative paths, so the whole folder can be moved or zipped as-is.
+
+## JSON contract
+
+On success (`ok=true`), stdout carries:
+
+| Field | Contents |
+| --- | --- |
+| `markdown_path` | Path to the generated file |
+| `document_info.outline` | Document TOC as `[level, title, page]` |
+| `pages[].text_status` | `extracted` / `scan_required` / `error` |
+| `pages[].page_class` | `native` / `scanned` / `mixed` |
+| `pages[].quality` | `text_density`, `text_chars`, `has_table`, `has_image`, `suspected_scan`, `garbled`, `confidence` |
+| `pages[].warnings` | e.g. `garbled_text_detected` |
+| `pages[].images[].bbox` | `{x0, y0, x1, y1}` |
+| `pages[].links` | `[{kind, uri?, page?}]` |
+| `summary` | `scan_pages`, `link_count`, `table_count`, `image_count` |
+| `quality_warnings` | Aggregated cross-page confidence notes |
+| `cache_hit` | `true` if the result came from cache |
+
+On failure (`ok=false`), `error.code` is one of `FILE_NOT_FOUND`, `NOT_PDF`, `OPEN_FAILED`, `PASSWORD_REQUIRED`, `WRITE_FAILED`, `IMPORT_FAILED`, `ARG_MISSING`, `UNEXPECTED_ERROR`.
+
+## Privacy & security
+
+- Files are processed locally. Nothing is uploaded anywhere.
+- The script makes **no network calls**, spawns **no subprocesses**, and sends **no telemetry**. It imports only the standard library plus PyMuPDF.
+- The only deletion the script performs is inside its own cache directory, `~/.cache/pdf-structured-extractor/`. It never deletes or overwrites anything in your output directory beyond the files it writes.
+- Encrypted PDFs return `PASSWORD_REQUIRED`; the script never attempts to crack them.
+
+## Limitations
+
+- No PDF writing: no merge, split, rotate, encrypt, annotate or watermark.
+- No local OCR — that is intentional, scanned pages go through vision instead.
+- Cross-page tables, nested tables and highly irregular layouts may extract poorly.
+- Files under 100MB are recommended; very large documents are processed page by page and take longer.
+
+## License
+
+[MIT](LICENSE)
