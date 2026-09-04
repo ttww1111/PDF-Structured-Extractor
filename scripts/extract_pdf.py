@@ -20,7 +20,8 @@ import csv
 import json
 import shutil
 import hashlib
-import io
+import math
+import re
 import statistics
 import argparse
 from pathlib import Path
@@ -91,7 +92,7 @@ SOLID_UNIQUE_COLORS = 2     # 唯一颜色数 ≤ 此值且面积足够大 → �
 MIXED_TEXT_MAX = 200        # 文字字符数低于此值且含图 → 视为 mixed（图文混合偏图）
 NATIVE_TEXT_MIN = 20        # 文字字符数低于此值 → 视为稀疏，置信度降级
 # 脚本版本（纳入缓存键，版本升级自动失效旧缓存）
-SCRIPT_VERSION = "2.2.1"
+SCRIPT_VERSION = "2.2.2"
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -206,15 +207,16 @@ def _line_in_rects(ln, rects):
     return False
 
 
-def build_text_section(lines, page_width, exclude_rects=None):
-    """将排序后的文本行拼成 Markdown 文本段落。
+def build_text_section(lines, page_width, exclude_rects=None, plain=False):
+    """将排序后的文本行拼成文本段落。
 
     exclude_rects: 表格 bbox 列表，落在其中的文字行将被跳过（避免与表格重复）。
+    plain: True 时只保留段落与换行，不引入 Markdown 标题语法。
     """
     if not lines:
         return ""
     ordered, _ = order_lines(lines, page_width)
-    body_size = body_size_of(lines)
+    body_size = 0.0 if plain else body_size_of(lines)
     out = []
     prev = None
     for ln in ordered:
@@ -222,7 +224,7 @@ def build_text_section(lines, page_width, exclude_rects=None):
         if exclude_rects and _line_in_rects(ln, exclude_rects):
             prev = ln
             continue
-        level = classify_heading(ln, body_size)
+        level = None if plain else classify_heading(ln, body_size)
         if level:
             out.append(f"\n{level} {ln['text']}\n")
             prev = ln
@@ -234,35 +236,8 @@ def build_text_section(lines, page_width, exclude_rects=None):
                 out.append("")  # 段落间空行
         out.append(ln["text"])
         prev = ln
-    text = "\n".join(out).strip()
     # 清理多余空行
-    while "\n\n\n" in text:
-        text = text.replace("\n\n\n", "\n\n")
-    return text
-
-
-def build_text_section_plain(lines, page_width, exclude_rects=None):
-    """纯文本版：仅段落与换行，不引入 Markdown 标题/强调语法。"""
-    if not lines:
-        return ""
-    ordered, _ = order_lines(lines, page_width)
-    out = []
-    prev = None
-    for ln in ordered:
-        if exclude_rects and _line_in_rects(ln, exclude_rects):
-            prev = ln
-            continue
-        if prev is not None:
-            gap = ln["y0"] - prev["y1"]
-            line_h = max(prev["y1"] - prev["y0"], 1)
-            if gap > line_h * PAGE_SEP_GAP_RATIO:
-                out.append("")
-        out.append(ln["text"])
-        prev = ln
-    text = "\n".join(out).strip()
-    while "\n\n\n" in text:
-        text = text.replace("\n\n\n", "\n\n")
-    return text
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out).strip())
 
 
 def _try_pymupdf4llm(doc, page_no):
@@ -294,7 +269,7 @@ def markdown_table(cells):
 
 
 def table_has_content(cells):
-    if not cells or len(cells) < 1:
+    if not cells:
         return False
     cols = max((len(r) for r in cells), default=0)
     if cols < 1:
@@ -316,7 +291,6 @@ def extract_tables(page, page_no, tables_dir, preview_dir, dpi, no_tables):
     if no_tables:
         return md_blocks, entries, rects
     strategies = ["lines_strict", "text"]
-    found = []
     page_w = page.rect.width
     page_h = page.rect.height
     for strat in strategies:
@@ -370,14 +344,18 @@ def extract_tables(page, page_no, tables_dir, preview_dir, dpi, no_tables):
                 rects.append(fitz.Rect(table.bbox))
             except Exception:
                 pass
-            found.append(table)
-        if found:
+        if entries:
             break  # 一个策略成功即止，避免重复
     return md_blocks, entries, rects
 
 
 def _image_unique_colors(pix, max_samples=2000):
-    """估算图片唯一颜色数（下采样），用于低信息量判断。失败返回 None。"""
+    """估算图片唯一颜色数（下采样），用于低信息量判断。失败返回 None。
+
+    采样步长按 sqrt 拆分到 x/y 两轴。此前直接用 total//max_samples 作为二维
+    步长，实际采样数只有 (h/step)*(w/step) —— 800x500 的图仅采 12 点（目标
+    2000），且步长常与图片宽度成整数倍而共振，会漏掉条纹等高频内容。
+    """
     try:
         n = pix.n
         w, h = pix.width, pix.height
@@ -387,7 +365,7 @@ def _image_unique_colors(pix, max_samples=2000):
         total = w * h
         if total == 0:
             return None
-        step = max(1, total // max_samples)
+        step = max(1, int(round(math.sqrt(max(1.0, total / max_samples)))))
         colors = set()
         stride = w * n
         for y in range(0, h, step):
@@ -402,15 +380,23 @@ def _image_unique_colors(pix, max_samples=2000):
         return None
 
 
-def _page_image_rects(page):
+def _page_image_rects(page, img_list=None):
     """返回 {xref: 最大覆盖面积的 fitz.Rect}，用于内容级过滤与 bbox 记录。
+
+    img_list 为 page.get_images(full=True) 的结果，由调用方传入以复用
+    （同一页不必重复调用 get_images）。
 
     注意：本版本 PyMuPDF 的 page.get_image_info 用 'number'（局部序号）而非
     xref，无法直接映射；改用 page.get_image_rects(xref) 按 xref 取放置区域。
     """
     rects_for = {}
+    if img_list is None:
+        try:
+            img_list = page.get_images(full=True)
+        except Exception:
+            return rects_for
     try:
-        for xref, *_ in page.get_images(full=True):
+        for xref, *_ in img_list:
             try:
                 rlist = page.get_image_rects(xref)
             except Exception:
@@ -435,13 +421,13 @@ def extract_images(doc, page, page_no, images_dir, seen_hashes, no_images):
     refs = []
     if no_images:
         return refs
-    rects_for = _page_image_rects(page)
-    page_area = page.rect.width * page.rect.height
-    page_paths = set()  # 同一页内按内容去重，避免重复引用同一张图
     try:
         img_list = page.get_images(full=True)
     except Exception:
         return refs
+    rects_for = _page_image_rects(page, img_list)
+    page_area = page.rect.width * page.rect.height
+    page_paths = set()  # 同一页内按内容去重，避免重复引用同一张图
     for xref, *_ in img_list:
         try:
             info = doc.extract_image(xref)
@@ -503,25 +489,29 @@ def extract_images(doc, page, page_no, images_dir, seen_hashes, no_images):
     return refs
 
 
-def is_scanned(lines, page):
+def has_images(page):
+    """页面是否含嵌入图片。整页只调一次，供扫描判定/质量信号复用。"""
+    try:
+        return bool(page.get_images(full=True))
+    except Exception:
+        return False
+
+
+def is_scanned(lines, has_img):
     """判定是否需要扫描渲染：文字层几乎为空（<阈值）且页面含图片，视为无文字层的扫描页。"""
     text_chars = sum(len(ln["text"]) for ln in lines)
-    try:
-        has_img = bool(page.get_images(full=True))
-    except Exception:
-        has_img = False
     return (text_chars < SCAN_TEXT_THRESHOLD) and has_img, text_chars
 
 
-# 高置信 mojibake 双字符：UTF-8 被当作 Latin-1 解码的典型产物（西方语言）
+# 高置信 mojibake 双字符：UTF-8 被当作 cp1252/Latin-1 解码的典型产物（西方语言）
 MOJI_TOKENS = [
     "Ã©", "Ã¨", "Ã¢", "Ã®", "Ã¯", "Ã´", "Ã»", "Ã¤", "Ã¶", "Ã¼", "Ã±", "Ã§", "Ãª",
     "â€", "â€™", "â€œ", "â€\u009d", "â€“", "â€”",
     "Â°", "Â©", "Â®", "Â´", "Â²", "Â³", "Â¡", "Â¿",
 ]
 # CJK 乱码中常见的 Latin-1 组合/控制符（真实正文中极少单独成串出现）
-COMBINING_L1 = set([0xAD, 0xA8, 0xB4, 0xB8,
-                    0x02DB, 0x02D8, 0x02D9, 0x02DA, 0x02DC, 0x02DD])
+COMBINING_L1 = {0xAD, 0xA8, 0xB4, 0xB8,
+                0x02DB, 0x02D8, 0x02D9, 0x02DA, 0x02DC, 0x02DD}
 
 
 def is_garbled(text):
@@ -529,7 +519,7 @@ def is_garbled(text):
 
     仅针对高置信信号，避免误伤正常外文/中文文本：
       ① U+FFFD 替换符占比偏高（编码失败）
-      ② 出现 Latin-1 mojibake 双字符（UTF-8 被误读为 Latin-1，如 Ã© 代 é）
+      ② 出现 cp1252 mojibake 双字符（UTF-8 被误读为 cp1252，如 Ã© 代 é）
       ③ CJK 乱码：大量 Latin-1 组合/控制符，且无真实 CJK、无实质 ASCII 词
     命中返回 True。
     """
@@ -623,18 +613,15 @@ def extract_page(doc, page, page_no, out_dir, opts):
     page_width = page.rect.width
     page_height = page.rect.height
     lines = collect_lines(page)
-    body_size = body_size_of(lines)
-    scanned, text_chars = is_scanned(lines, page)
+    has_img = has_images(page)
+    scanned, text_chars = is_scanned(lines, has_img)
     full_text = "\n".join(ln["text"] for ln in lines)
     garbled = is_garbled(full_text)
-    try:
-        has_img = bool(page.get_images(full=True))
-    except Exception:
-        has_img = False
 
     fmt = opts["format"]
     warnings = []
     page_md_parts = []
+    scans_dir = os.path.join(out_dir, "scans")
     tables_md, tables_json, table_rects = extract_tables(
         page, page_no, os.path.join(out_dir, "tables"),
         os.path.join(out_dir, "tables_preview"), opts["dpi"], opts["no_tables"])
@@ -645,17 +632,16 @@ def extract_page(doc, page, page_no, out_dir, opts):
     text_md = ""
     scan_png = None
     used_lib = False
-    if scanned:
-        scan_png = render_scan(page, page_no, os.path.join(out_dir, "scans"), opts["dpi"])
+    # scanned 与 garbled 必然互斥：前者要求 text_chars < 3，后者要求非空字符 >= 8
+    if scanned or (garbled and has_img):
+        # 扫描页无文字层，或文字层乱码但页面有图（视觉渲染为真实字形）→ 交视觉识别
+        scan_png = render_scan(page, page_no, scans_dir, opts["dpi"])
         text_status = "scan_required"
-    elif garbled and has_img:
-        # 文字层乱码但页面有图（视觉渲染为真实字形）→ 交视觉识别
-        scan_png = render_scan(page, page_no, os.path.join(out_dir, "scans"), opts["dpi"])
-        text_status = "scan_required"
-        warnings.append("garbled_text_detected")
+        if garbled:
+            warnings.append("garbled_text_detected")
     else:
         if fmt == "text":
-            text_md = build_text_section_plain(lines, page_width, table_rects)
+            text_md = build_text_section(lines, page_width, table_rects, plain=True)
         else:
             if opts["md_lib"] != "builtin":
                 lib_md = _try_pymupdf4llm(doc, page_no)
@@ -948,7 +934,6 @@ def main():
         "no_images": args.no_images,
         "no_tables": args.no_tables,
         "no_links": args.no_links,
-        "no_cache": args.no_cache,
         "format": args.format,
         "md_lib": resolve_md_lib(args.md_lib),
         "seen_hashes": {},
@@ -1072,7 +1057,6 @@ def main():
             "link_count": link_count,
         },
         "quality_warnings": quality_warnings,
-        "warnings": [],
     }
 
     # 写入缓存（除非禁用）

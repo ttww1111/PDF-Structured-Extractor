@@ -113,7 +113,7 @@ On success (`ok=true`), stdout carries:
 | `pages[].warnings` | e.g. `garbled_text_detected` |
 | `pages[].images[].bbox` | `{x0, y0, x1, y1}` |
 | `pages[].links` | `[{kind, uri?, page?}]` |
-| `summary` | `scan_pages`, `link_count`, `table_count`, `image_count` |
+| `summary` | `text_pages`, `scan_pages`, `link_count`, `table_count`, `image_count` |
 | `quality_warnings` | Aggregated cross-page confidence notes |
 | `cache_hit` | `true` if the result came from cache |
 

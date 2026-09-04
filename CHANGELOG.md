@@ -2,6 +2,16 @@
 
 ---
 
+## 2.2.2 · 2026-09-04
+
+v2.2.2：代码审查后的缺陷修复与冗余清理（无功能/输出变化，回归基线逐字节一致）：
+- **修复颜色采样 bug**（`_image_unique_colors`）：原一维步长用在二维循环，800×500 图仅采 12 点（目标 2000），会误杀高频内容的图（条纹/密集线条）判成纯色块。改为 x/y 各按 `sqrt` 拆分步长，实测 2088 点、正确识别。
+- **删除死代码**：未使用的 `import io`；`extract_page` 内算完未用的 `body_size`；从未被读的 `opts["no_cache"]`；恒为空的顶层 `result["warnings"]`；`extract_tables` 中仅用于 break 判断的 `found` 列表。
+- **性能**：每页 `page.get_images()` 调用从 4 次降到 2 次（新增 `has_images()`，并让 `_page_image_rects` 复用调用方的 img_list）。
+- **去重重构**：`build_text_section` 与 `build_text_section_plain` 合并为带 `plain` 参数的单函数。
+- **小修**：`while "\n\n\n"` 冗余替换改 `re.sub(r"\n{3,}", "\n\n", …)`；`set([…])` → `{…}`；`table_has_content` 冗余条件；mojibake 注释的 "Latin-1" 改为更准确的 cp1252。
+- **文档**：SKILL.md / README 的 JSON 契约表补 `summary.text_pages`；版本号同步至 2.2.2（缓存因此失效一次）。
+
 ## 2.2.1 · 2026-09-04
 
 v2.2.1：面向公开目录发布的完善（无功能变更，缓存因脚本版本号变化自动失效一次）：

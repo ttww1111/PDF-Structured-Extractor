@@ -20,10 +20,10 @@ license: MIT
 compatibility: Requires Python 3.8+ and PyMuPDF >= 1.28.2. Works with any agent that can run shell commands.
 metadata:
   author: Tony
-  version: "2.2.1"
+  version: "2.2.2"
   tags: pdf pdf-extraction markdown table-extraction document-parsing pymupdf ocr-free
 agent_created: true
-version: 2.2.1
+version: 2.2.2
 ---
 
 # PDF 结构化提取
@@ -160,7 +160,7 @@ python3 "<skill_dir>/scripts/extract_pdf.py" \
 
 - 成功：`ok=true`，含 `markdown_path`、`document_info`、`pages`、`summary`、`quality_warnings`、`cache_hit`
   - `document_info.outline`：文档大纲（TOC）列表 `[层级, 标题, 页码]`
-  - `summary.scan_pages`：需要视觉识别的页码列表
+  - `summary.text_pages` / `scan_pages`：提取成功 / 需视觉识别的页码列表
   - `summary.link_count` / `table_count` / `image_count`
   - `quality_warnings`：跨页聚合的置信提示，如 `第3页: 疑似扫描件/无文字层，已渲染 PNG 待视觉识别`、`第1页: 文字密度偏低，提取结果可能不完整`
   - `cache_hit`：`true` 表示本次结果来自缓存
