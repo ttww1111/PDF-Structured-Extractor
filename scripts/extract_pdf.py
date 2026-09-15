@@ -92,7 +92,7 @@ SOLID_UNIQUE_COLORS = 2     # 唯一颜色数 ≤ 此值且面积足够大 → �
 MIXED_TEXT_MAX = 200        # 文字字符数低于此值且含图 → 视为 mixed（图文混合偏图）
 NATIVE_TEXT_MIN = 20        # 文字字符数低于此值 → 视为稀疏，置信度降级
 # 脚本版本（纳入缓存键，版本升级自动失效旧缓存）
-SCRIPT_VERSION = "2.2.2"
+SCRIPT_VERSION = "2.2.4"
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -261,7 +261,9 @@ def markdown_table(cells):
     norm = [r + [""] * (cols - len(r)) for r in cells]
 
     def esc(v):
-        return " " + str(v).replace("|", "\\|").replace("\n", " ") + " "
+        # PyMuPDF 用 None 表示空单元格；必须输出空串，而不是字面量 "None"
+        s = "" if v is None else str(v)
+        return " " + s.replace("|", "\\|").replace("\n", " ") + " "
     header = "|" + "|".join(esc(c) for c in norm[0]) + "|"
     sep = "|" + "|".join("---" for _ in range(cols)) + "|"
     body = "\n".join("|" + "|".join(esc(c) for c in row) + "|" for row in norm[1:])
@@ -274,8 +276,200 @@ def table_has_content(cells):
     cols = max((len(r) for r in cells), default=0)
     if cols < 1:
         return False
-    non_empty = sum(1 for row in cells for c in row if str(c).strip())
+    non_empty = sum(
+        1 for row in cells for c in row if c is not None and str(c).strip()
+    )
     return non_empty > 0
+
+
+# ------------------------------------------------------------------ 表格规整
+# 合并单元格归位 / 空列剔除：两者都只在「确认可判定」时才动手，无法判定就原样
+# 返回，因此不会让本来正确的表变差；如要拿 PyMuPDF 原始 extract() 结果做对比，
+# 把 NORMALIZE_TABLE 设为 False 即可。
+NORMALIZE_TABLE = True
+MERGE_MAX_GROUPS = 2
+# 相邻两词跨列时，水平空隙至少要有「字高 × 该比例」，才算两个独立字段。
+# 实测：PO 4469 合计行 Total→$1,489.00 gap/字高 = 6.32（真·两个字段）；
+# 条码标签 Item No. 50890 被栅格切开时 gap/字高 = 0.20（其实是一句话）。
+# 取 1.5 对两者都有 4~7 倍余量；宁可漏判（退回原样）也绝不把整句打散。
+MERGE_MIN_GAP_RATIO = 1.5
+
+
+def _grid_columns(table):
+    """表格的参考栅格列 [(x0, x1), ...]，长度与 table.col_count 严格对齐。
+
+    PyMuPDF 不直接暴露列边界，这里拿表头行的 cells（每列一个 bbox）当栅格。
+    表头里为 None 的列（隐藏列 / 被合并掉的列）用相邻边界插值成零宽占位，保证
+    列索引与 table.extract() 的列索引一一对应；表头整体不可用时退化为「cells
+    最多的一行」。返回 None 表示无法判定，调用方跳过分列归位。
+    """
+    try:
+        ncol = int(table.col_count)
+    except Exception:
+        return None
+    if ncol <= 0:
+        return None
+    raw = []
+    hdr = getattr(table, "header", None)
+    if hdr is not None:
+        raw = list(getattr(hdr, "cells", None) or [])
+    if not any(c is not None for c in raw):
+        best = []
+        for row in getattr(table, "rows", []) or []:
+            cs = list(getattr(row, "cells", None) or [])
+            if sum(1 for c in cs if c is not None) > sum(1 for c in best if c is not None):
+                best = cs
+        raw = best
+    if not raw or not any(c is not None for c in raw):
+        return None
+    try:
+        bx0, bx1 = float(table.bbox[0]), float(table.bbox[2])
+    except Exception:
+        bx0, bx1 = 0.0, 0.0
+    cols = [None if c is None else (float(c[0]), float(c[2])) for c in raw[:ncol]]
+    cols += [None] * (ncol - len(cols))
+    for i in range(ncol):
+        c = cols[i]
+        if c is not None and c[1] - c[0] > 0.5:
+            continue
+        left = next((cols[j][1] for j in range(i - 1, -1, -1) if cols[j]), None)
+        right = next((cols[j][0] for j in range(i + 1, ncol) if cols[j]), None)
+        lo = left if left is not None else bx0
+        hi = right if right is not None else bx1
+        cols[i] = (lo, hi) if hi >= lo else (lo, lo)
+    # 保证区间从左到右非递减，避免倒挂区间把词吸进错误的列
+    for i in range(1, ncol):
+        if cols[i][0] < cols[i - 1][0]:
+            cols[i] = (cols[i - 1][0], max(cols[i][1], cols[i - 1][0]))
+    return cols
+
+
+def _column_of(grid, cx, span):
+    """词心 x 落在哪个栅格列；落在零宽/缝隙时吸附到 span 内最近的列。"""
+    for k in span:
+        gx0, gx1 = grid[k]
+        if gx0 <= cx < gx1:
+            return k
+    return min(span, key=lambda k: min(abs(cx - grid[k][0]), abs(cx - grid[k][1])))
+
+
+def _has_column_gap(assigned):
+    """判断「一个合并单元格里的文字」是否真的能拆成多个独立字段。
+
+    assigned 为按阅读顺序排列的 [(列索引, word), ...]。只允许同一行内、且横向
+    空隙足够大的相邻词被分到不同列；出现下列任一情况即整体放弃重排：
+      · 相邻两词分属不同列、却不在同一行 —— 说明列边界切在了正常的多行文字中间
+        （实测报关放行单：格内第一行「境内货源地(33199)」、第二行「东阳」被拆到
+        两列，结果值跑到标签左边）；
+      · 同一行的相邻两词分属不同列、但空隙只相当于一个空格 —— 说明这本来就是
+        一句话（实测条码标签：「Item No. 50890」gap/字高 = 0.20，而真正的
+        「Total / $1,489.00」= 6.32）。
+    漏判只会退回 PyMuPDF 原始结果，误判却会把正常文字打散，代价不对称，故从严。
+    """
+    for (c1, w1), (c2, w2) in zip(assigned, assigned[1:]):
+        if c1 == c2:
+            continue
+        h = max(w1[3] - w1[1], w2[3] - w2[1], 1.0)
+        if abs(w1[1] - w2[1]) > 0.6 * h:
+            return False
+        if (w2[0] - w1[2]) < MERGE_MIN_GAP_RATIO * h:
+            return False
+    return True
+
+
+def relocate_merged_cells(cells, table, page, grid, max_groups=MERGE_MAX_GROUPS):
+    """把跨列合并单元格里的文本按「词心 x」送回它视觉上所在的列。
+
+    合计行是典型受害者：`Total   $1,489.00` 在 PDF 里是一个跨列合并单元格，
+    table.extract() 会把整串文本塞进最左边那个栅格列（常常是隐藏列），于是
+    CSV 里凭空多出一列、金额错位（实测 PO 4469：Total 落到 idx3、金额本应属
+    Amount 列）。这里改用 get_text("words") 逐词按 x 落位 —— 比搬整块文本更稳，
+    也不会像 get_textbox 那样把跨界的词截断。
+    仅当文本落点 ≤ max_groups 列时才重排（默认 2 = 标签 + 金额），且跨列相邻词之间
+    必须有「跨列级」水平空隙（见 `_has_column_gap`），避免把横跨整行的说明性文字
+    或一句被栅格误切开的正常词组打散；目标列已有内容时也放弃重排，宁可不改。
+    """
+    if not grid or page is None or not cells:
+        return cells
+    rows = list(getattr(table, "rows", None) or [])
+    if len(rows) != len(cells):
+        return cells
+    out = [list(r) for r in cells]
+    for ri, row in enumerate(rows):
+        row_cells = list(getattr(row, "cells", None) or [])
+        for ci, cb in enumerate(row_cells):
+            if cb is None or ci >= len(out[ri]):
+                continue
+            val = out[ri][ci]
+            if val is None or not str(val).strip():
+                continue
+            x0, x1 = float(cb[0]), float(cb[2])
+            span = [
+                k for k, (gx0, gx1) in enumerate(grid)
+                if gx1 > gx0 and gx1 > x0 + 0.5 and gx0 < x1 - 0.5
+            ]
+            if len(span) < 2:          # 没跨列 → 不是合并单元格，原样保留
+                continue
+            try:
+                words = page.get_text("words", clip=fitz.Rect(cb))
+            except Exception:
+                continue
+            assigned = []
+            for w in words:
+                if not str(w[4]).strip():
+                    continue
+                assigned.append((_column_of(grid, (w[0] + w[2]) / 2.0, span), w))
+            if not assigned:
+                continue
+            assigned.sort(key=lambda cw: (round(cw[1][1]), cw[1][0]))
+            buckets = {}
+            for k, w in assigned:
+                buckets.setdefault(k, []).append(w)
+            if len(buckets) < 2 or len(buckets) > max_groups:
+                continue
+            if not _has_column_gap(assigned):
+                continue
+            if any(
+                k < len(out[ri]) and out[ri][k] not in (None, "") and str(out[ri][k]).strip()
+                for k in buckets
+            ):
+                continue
+            placed = {}
+            for k, ws in buckets.items():
+                ws.sort(key=lambda w: (round(w[1]), w[0]))
+                lines = []
+                last_y = None
+                for w in ws:
+                    y = round(w[1])
+                    if last_y is None or abs(y - last_y) > 1.5:
+                        lines.append(w[4])
+                        last_y = y
+                    else:
+                        lines[-1] += " " + w[4]
+                placed[k] = "\n".join(lines)
+            out[ri][ci] = ""
+            for k, v in placed.items():
+                out[ri][k] = v
+    return out
+
+
+def drop_empty_columns(cells):
+    """剔除所有行都为空的列 —— 通常是隐藏列或边框伪列。
+
+    判定标准是「全表皆空」，因此不可能误删任何数据；全部列都空或没有可删的列
+    时原样返回。
+    """
+
+    def blank(v):
+        return v is None or not str(v).strip()
+
+    if not cells:
+        return cells
+    ncol = max(len(r) for r in cells)
+    keep = [j for j in range(ncol) if any(j < len(r) and not blank(r[j]) for r in cells)]
+    if not keep or len(keep) == ncol:
+        return cells
+    return [[(r[j] if j < len(r) else None) for j in keep] for r in cells]
 
 
 def extract_tables(page, page_no, tables_dir, preview_dir, dpi, no_tables):
@@ -290,7 +484,17 @@ def extract_tables(page, page_no, tables_dir, preview_dir, dpi, no_tables):
     rects = []
     if no_tables:
         return md_blocks, entries, rects
-    strategies = ["lines_strict", "text"]
+    # 策略顺序：lines 必须排第一（PyMuPDF 默认策略）。三种策略语义见 pymupdf/table.py：
+    #   lines        = filter_edges(EDGES, "h"/"v")          → 矢量线 + 填充矩形（底纹）的边界
+    #   lines_strict = filter_edges(..., edge_type="line")   → 只认矢量线段，丢弃所有填充矩形
+    #   text         = words_to_edges_h/v                    → 纯按文字位置推边
+    # 订单/报价单这类表格常常行间没有横线，只靠隔行底纹（zebra shading）分行。
+    # lines_strict 会把底纹一并丢掉 → 明细区一条内部水平边都不剩 → N 个明细行被并成
+    # 1 行、单元格内用 \n 拼接（实测 PO 4469：3 行 vs 正确的 7 行）。
+    # lines 能用底纹矩形的上下边正确切分（2 条带 = 4 条边 = 5 段），故：
+    # lines 优先，lines_strict / text 仅作兜底（注意 lines 会把表格区内任何填充矩形
+    # 当边界，若表内有装饰色块可能过度切分）。
+    strategies = ["lines", "lines_strict", "text"]
     page_w = page.rect.width
     page_h = page.rect.height
     for strat in strategies:
@@ -305,6 +509,10 @@ def extract_tables(page, page_no, tables_dir, preview_dir, dpi, no_tables):
                 cells = table.extract()
             except Exception:
                 continue
+            if NORMALIZE_TABLE:
+                # 先把合并单元格的文本送回正确列，再剔除"全表皆空"的隐藏列
+                cells = relocate_merged_cells(cells, table, page, _grid_columns(table))
+                cells = drop_empty_columns(cells)
             if not table_has_content(cells):
                 continue
             tid = f"p{page_no:03d}_t{idx:02d}"
@@ -315,7 +523,8 @@ def extract_tables(page, page_no, tables_dir, preview_dir, dpi, no_tables):
                 with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
                     w = csv.writer(f)
                     for row in cells:
-                        w.writerow([str(c) for c in row])
+                        # 同 markdown_table：None → 空串，避免 CSV 里出现字面量 "None"
+                        w.writerow(["" if c is None else str(c) for c in row])
             except Exception:
                 csv_path = None
             # 表格预览图

@@ -14,16 +14,16 @@ dependency:
   - pymupdf>=1.28.2
 author: Tony
 slug: pdf-structured-extractor
-displayName: PDF结构化提取
+displayName: PDF Structured Extractor
 summary: 结构化提取 PDF 文字/表格/图片，扫描页走视觉识别，可选缓存与置信信号，跨客户端通用（WorkBuddy/Claude Code/Codex）。
 license: MIT
 compatibility: Requires Python 3.8+ and PyMuPDF >= 1.28.2. Works with any agent that can run shell commands.
 metadata:
   author: Tony
-  version: "2.2.2"
+  version: "2.2.4"
   tags: pdf pdf-extraction markdown table-extraction document-parsing pymupdf ocr-free
 agent_created: true
-version: 2.2.2
+version: 2.2.4
 ---
 
 # PDF 结构化提取
